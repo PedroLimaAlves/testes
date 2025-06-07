@@ -1,6 +1,6 @@
 from socket import *
 import pickle
-from constMP2 import *
+from constMPT import *
 import time
 import sys
 
