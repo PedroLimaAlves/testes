@@ -6,5 +6,6 @@ SERVER_PORT = 5678
 GROUPMNGR_ADDR = '98.81.198.30'
 GROUPMNGR_TCP_PORT = 5680
 
-ACK_TIMEOUT = 0.1 # Tempo em segundos para esperar por um ACK antes de retransmitir
-MAX_RETRIES = 5 # Número máximo de retransmissões para uma mensagem
+
+ACK_TIMEOUT = 0.5
+MAX_RETRIES = 10
