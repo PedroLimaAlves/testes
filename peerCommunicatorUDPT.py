@@ -107,8 +107,8 @@ def deliver_messages():
                 # Initialize it to original_timestamp - 1, expecting the next message to have this timestamp
                 # or a value derived from the first message's timestamp.
                 # A more robust solution might involve peers announcing their initial clock.
+                # If timestamps start at 1, this should be 0.
                 expected_clocks[sender_id] = original_timestamp - 1 # Expecting the first message to be 0 or 1.
-                                                                    # If timestamps start at 1, this should be 0.
                                                                     # This logic might need refinement based on exact timestamping.
 
 
@@ -120,4 +120,255 @@ def deliver_messages():
                 expected_clocks[sender_id] += 1
 
                 if msg_type == 'DATA':
-                    print(
+                    print(f'Message {msg_content} from process {sender_id} (timestamp: {original_timestamp}, delivered at: {next_timestamp})')
+                    logList.append((sender_id, msg_content, original_timestamp)) # Store original timestamp for comparison
+                    # Send ACK for data message
+                    # To correctly send ACK back, the original message must include sender's IP
+                    # For now, we'll send it to all peers except self (inefficient, but demonstrates ACK)
+                    send_ack_message(sender_id, original_timestamp)
+                elif msg_type == 'ACK':
+                    print(f'ACK received from process {sender_id} for message with original timestamp {original_timestamp} (ACK timestamp: {next_timestamp})')
+                elif msg_type == -1: # Stop message
+                    print(f'Stop message received from process {sender_id} (timestamp: {original_timestamp})')
+                    # No specific action needed for stop messages here as MsgHandler handles termination
+                else:
+                    print(f"Unknown message type: {msg_type}")
+            else:
+                # Message not yet ready for delivery, stop checking for now
+                break
+
+
+class MsgHandler(threading.Thread):
+    def __init__(self, sock):
+        threading.Thread.__init__(self)
+        self.sock = sock
+
+    def run(self):
+        # Declare global variables at the very beginning of the function
+        global handShakeCount
+        global logList
+        global expected_clocks
+        global myself # Needed to print myself when writing log file
+        global PEERS # Might need to access PEERS list
+        
+        print('Handler is ready. Waiting for the handshakes...')
+        
+        # logList is already initialized globally. No need to re-initialize here unless it's thread-specific.
+        # Assuming one logList for the entire peer process.
+
+        # Wait until handshakes are received from all other processes
+        # N-1 because we don't send handshake to ourselves
+        while handShakeCount < N - 1:
+            try:
+                msgPack, addr = self.sock.recvfrom(1024)
+                msg_content = pickle.loads(msgPack)
+                
+                # Handshake message format: ('READY', sender_id, timestamp)
+                if isinstance(msg_content, tuple) and len(msg_content) == 3 and msg_content[0] == 'READY':
+                    msg_type, sender_id, received_timestamp = msg_content
+                    update_logical_clock(received_timestamp) # Update clock on handshake
+                    handShakeCount += 1
+                    print(f'--- Handshake received from: {sender_id}')
+                    
+                    # Initialize expected clock for this peer if not already
+                    # The first message from a peer typically has timestamp 1 (or 0) if clock starts from 0/1
+                    # So, if their first message is timestamp X, we expect X next.
+                    # We initialize expected_clocks[sender_id] to X-1 so that X will be accepted.
+                    if sender_id not in expected_clocks:
+                        expected_clocks[sender_id] = received_timestamp - 1 # Expecting their first *data* message after handshake
+                else:
+                    print(f"Received non-handshake message during handshake phase: {msg_content}")
+            except Exception as e:
+                print(f"Error during handshake reception: {e}")
+                # Consider breaking or handling specific errors
+
+        print('Secondary Thread: Received all handshakes. Entering the loop to receive messages.')
+
+        stopCount = 0
+        while True:
+            try:
+                msgPack, addr = self.sock.recvfrom(32768)
+                msg = pickle.loads(msgPack)
+                
+                # Ensure msg is a tuple and has enough elements
+                if not isinstance(msg, tuple) or len(msg) < 3:
+                    print(f"Received malformed message: {msg}. Skipping.")
+                    continue
+
+                msg_type = msg[0]
+                # Timestamp is at index 3 for DATA/ACK, or index 2 for READY (though READY is handled above)
+                # For stop message (-1,-1,-1,timestamp), timestamp is at index 3.
+                received_timestamp = msg[3] if len(msg) > 3 else 0 
+
+                # 1º passo: atualiza o relógio lógico;
+                update_logical_clock(received_timestamp)
+
+                # 2° passo: coloca a mensagem na fila;
+                with queue_lock:
+                    # msg format: (type, sender_id, msg_content, original_timestamp)
+                    # We store the received_timestamp (Lamport's timestamp) as the priority
+                    heapq.heappush(message_queue, (received_timestamp, msg))
+                
+                # 3° passo: Se é mensagem de dados então enviar ACK (se for mensagem de ACK só faz 1º e 2º passo);
+                # This is handled by deliver_messages now
+
+                # 4º passo: verifica se "destrava" a primeira mensagem da fila e entrega a mensagem para a aplicação;
+                deliver_messages()
+
+                if msg_type == -1:  # count the 'stop' messages from the other processes
+                    stopCount = stopCount + 1
+                    # Check if all peers have sent a stop message.
+                    # N-1 because we don't count our own stop message if we sent it
+                    # (or N if we expect one from ourselves for symmetry, depending on design)
+                    # Assuming N-1 other peers will send stop messages.
+                    if stopCount == N - 1: 
+                        break  # stop loop when all other processes have finished
+
+            except Exception as e:
+                print(f"Error during message reception: {e}")
+                # In a real system, you might want more sophisticated error handling or a graceful shutdown.
+                break # Break on error to prevent infinite loop on bad data
+
+        # Write log file
+        logFile = open(f'logfile{myself}.log', 'w')
+        logFile.writelines(str(logList))
+        logFile.close()
+
+        # Send the list of messages to the server (using a TCP socket) for comparison
+        print('Sending the list of messages to the server for comparison...')
+        clientSock = socket(AF_INET, SOCK_STREAM)
+        clientSock.connect((SERVER_ADDR, SERVER_PORT))
+        msgPack = pickle.dumps(logList)
+        clientSock.send(msgPack)
+        clientSock.close()
+
+        # Reset for the next round
+        handShakeCount = 0
+        expected_clocks.clear()
+        with queue_lock:
+            message_queue.clear()
+        logList.clear() # Clear logList for the next round
+
+        print("MsgHandler thread finished its round.")
+        # Do not exit(0) here, as it kills the entire process.
+        # The main thread should manage the lifecycle.
+        # Instead, signal the main thread that this round is complete.
+        # For simplicity in this example, we'll let the main thread loop.
+        # If the main thread relies on this thread exiting to know a round is done,
+        # you might need a threading.Event.
+
+# The main loop needs to manage the MsgHandler thread's lifecycle if it doesn't exit(0).
+# For now, it will just keep waiting for the next signal.
+
+def send_ack_message(target_peer_id, original_msg_timestamp):
+    # To send a proper ACK back, the original DATA message should ideally contain the sender's IP.
+    # The current PEERS list contains only IPs without a direct mapping to sender_id.
+    # This is a simplification. For now, it will send the ACK to all peers except itself.
+    # In a production system, you'd want to store a mapping of peer_id to (IP, Port)
+    # or ensure the DATA message includes the sender's full address.
+
+    ack_timestamp = increment_logical_clock()
+    ack_msg = ('ACK', myself, original_msg_timestamp, ack_timestamp) # Format: (type, sender_id, original_msg_timestamp, ack_timestamp)
+    ack_msg_pack = pickle.dumps(ack_msg)
+    
+    # Iterate through the global PEERS list to send the ACK.
+    # This assumes PEERS contains only IP addresses.
+    my_ip = get_public_ip() # Get current peer's IP once
+    for addrToSend in PEERS:
+        if addrToSend != my_ip: # Don't send ACK to self
+            try:
+                sendSocket.sendto(ack_msg_pack, (addrToSend, PEER_UDP_PORT))
+                # Correção aqui: garantir que o print tenha apenas um par de parênteses
+                print(f'Sent ACK for message with original timestamp {original_msg_timestamp} to {addrToSend} (ACK timestamp: {ack_timestamp})')
+            except Exception as e:
+                print(f"Error sending ACK to {addrToSend}: {e}")
+
+# Function to wait for start signal from comparison server:
+def waitToStart():
+    global myself # Will be assigned here
+    global nMsgs # Will be assigned here
+    (conn, addr) = serverSock.accept()
+    msgPack = conn.recv(1024)
+    msg = pickle.loads(msgPack)
+    myself = msg[0]
+    nMsgs = msg[1]
+    conn.send(pickle.dumps(f'Peer process {myself} started.'))
+    conn.close()
+    return (myself,nMsgs)
+
+# From here, code is executed when program starts:
+registerWithGroupManager()
+while True: # Changed from while 1 for clarity
+    print('Waiting for signal to start...')
+    (myself, nMsgs) = waitToStart() # myself and nMsgs are updated globally here
+    print(f'I am up, and my ID is: {myself}')
+
+    if nMsgs == 0:
+        print('Terminating.')
+        # Clean up sockets before exiting
+        sendSocket.close()
+        recvSocket.close()
+        serverSock.close()
+        exit(0)
+    
+    # Get the latest list of peers before each round
+    # The getListOfPeers function already updates the global PEERS list.
+    PEERS = getListOfPeers()
+    
+    # Create receiving message handler thread
+    # Only start a new thread if the previous one is not alive (or if it terminated naturally).
+    # If MsgHandler.run() doesn't exit(0), then the thread will finish and can be joined.
+    # For this current setup, it will re-create.
+    msgHandler = MsgHandler(recvSocket)
+    msgHandler.start()
+    print('Handler started')
+    
+    # Send handshakes
+    my_ip = get_public_ip() # Get current peer's IP once for comparison
+    for addrToSend in PEERS:
+        if addrToSend != my_ip: # Don't send handshake to self
+            print(f'Sending handshake to {addrToSend}')
+            # Handshake message now includes the logical clock
+            handshake_timestamp = increment_logical_clock()
+            # Format: ('READY', sender_id, timestamp)
+            msg = ('READY', myself, handshake_timestamp)
+            msgPack = pickle.dumps(msg)
+            sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
+    
+    print(f'Main Thread: Sent all handshakes. handShakeCount={handShakeCount}')
+
+    # Wait for handshakes to be received by the MsgHandler.
+    # The `pass` loop is a busy-wait and should be replaced with a better sync mechanism
+    # like a threading.Event or Condition Variable in production.
+    # N-1 because we don't expect a handshake from ourselves.
+    while (handShakeCount < N - 1):
+        pass
+    
+    print('Main Thread: All handshakes received by handler. Starting data messages...')
+
+    # Send a sequence of data messages to all other processes
+    for msgNumber in range(0, nMsgs):
+        current_logical_clock = increment_logical_clock()
+        msg_content = msgNumber
+        # Message format: (type, sender_id, msg_content, timestamp)
+        msg = ('DATA', myself, msg_content, current_logical_clock)
+        msgPack = pickle.dumps(msg)
+        for addrToSend in PEERS:
+            if addrToSend != my_ip: # Don't send message to self
+                sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
+                print(f'Sent message {msgNumber} with timestamp {current_logical_clock} to {addrToSend}')
+
+    # Tell all processes that I have no more messages to send
+    for addrToSend in PEERS:
+        if addrToSend != my_ip: # Don't send stop message to self
+            stop_timestamp = increment_logical_clock()
+            # Format: (type, sender_id, msg_content, timestamp)
+            # Use -1 for sender_id and msg_content to signify a stop message, include my ID for logging/debug
+            msg = (-1, myself, -1, stop_timestamp) 
+            msgPack = pickle.dumps(msg)
+            sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
+
+    # Wait for the MsgHandler thread to finish processing messages for this round.
+    # This is important before the main thread loops back to waitToStart().
+    msgHandler.join()
+    print("Main Thread: MsgHandler finished for this round. Preparing for next round...")
