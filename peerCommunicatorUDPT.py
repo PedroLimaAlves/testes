@@ -80,7 +80,7 @@ class MsgHandler(threading.Thread):
                 expected_sequence_number[i] = 0 # Espera a primeira mensagem (seq 0) de cada peer
 
         # Espera até que os handshakes sejam recebidos de todos os outros processos
-        while handShakeCount < N - 1: # N-1 porque não contamos a si mesmo
+        while handShakeCount < N: # N-1 porque não contamos a si mesmo
             try:
                 msgPack, addr = self.sock.recvfrom(1024)
                 msg = pickle.loads(msgPack)
@@ -260,7 +260,7 @@ while True:
     print(f'Main Thread: Sent all handshakes. Waiting for all HANDSHAKE ACKs. handShakeCount (from handler)={handShakeCount}')
     
     # Espera que a thread de mensagens confirme que todos os handshakes foram recebidos
-    while handShakeCount < N - 1:
+    while handShakeCount < N:
         time.sleep(0.1) # Espera ativa, pode ser melhorada com semáforos ou eventos
 
     print('Main Thread: All handshakes acknowledged. Starting to send data messages.')
