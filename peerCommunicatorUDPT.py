@@ -5,21 +5,17 @@ import random
 import pickle
 from requests import get
 
-# Counter to make sure we have received handshakes from all other processes
 handShakeCount = 0
-
 PEERS = []
 lamport_clock = 0
 msgQueue = []
 delivered = set()
 acks_received = {}
 
-# UDP sockets to send and receive data messages:
 sendSocket = socket(AF_INET, SOCK_DGRAM)
 recvSocket = socket(AF_INET, SOCK_DGRAM)
 recvSocket.bind(('0.0.0.0', PEER_UDP_PORT))
 
-# TCP socket to receive start signal from the comparison server:
 serverSock = socket(AF_INET, SOCK_STREAM)
 serverSock.bind(('0.0.0.0', PEER_TCP_PORT))
 serverSock.listen(1)
@@ -89,7 +85,6 @@ class MsgHandler(threading.Thread):
           break
         continue
 
-      # Atualiza relógio lógico
       recv_clock = msg[-1]
       lamport_clock = max(lamport_clock, recv_clock) + 1
 
@@ -99,7 +94,6 @@ class MsgHandler(threading.Thread):
         logList.append((sender_id, msg_number, msg_time))
         msgQueue.append((sender_id, msg_number, msg_time))
 
-        # Envia ACK
         lamport_clock += 1
         ack = pickle.dumps(("ACK", myself, (sender_id, msg_number), lamport_clock))
         sendSocket.sendto(ack, (PEERS[sender_id], PEER_UDP_PORT))
@@ -111,15 +105,18 @@ class MsgHandler(threading.Thread):
           acks_received[data_id] = set()
         acks_received[data_id].add(ack_sender)
 
-      # Entrega ordenada
-      for entry in list(msgQueue):
-        sender_id, msg_number, msg_time = entry
+      # Entrega ordenada com fila baseada em timestamp
+      msgQueue.sort(key=lambda x: (x[2], x[0]))  # (timestamp, sender_id)
+      while msgQueue:
+        sender_id, msg_number, msg_time = msgQueue[0]
         key = (sender_id, msg_number)
         if len(acks_received.get(key, set())) == (N - 1):
           if key not in delivered:
             delivered.add(key)
             print(f"Delivered message {msg_number} from process {sender_id}")
-            msgQueue.remove(entry)
+            msgQueue.pop(0)
+        else:
+          break
 
     logFile = open('logfile' + str(myself) + '.log', 'w')
     logFile.writelines(str(logList))
