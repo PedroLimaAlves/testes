@@ -164,6 +164,7 @@ class MsgHandler(threading.Thread):
                     print(f'[{time.time()}] --- Handshake received from {addr[0]}. Total handshakes: {handShakeCount}')
                 elif msg["type"] == 'ACK' and msg["original_type"] == 'READY':
                     # Este peer enviou um handshake e recebeu um ACK. Não precisamos fazer nada aqui.
+                    print(f"[{time.time()}] Peer {myself} RECEIVED and REMOVED ACK for msg ID {msg['msg_id']} from {addr[0]} (Original: {msg['original_type']}). Pending ACKs count: {len(pending_acks)}") # Adicionado
                     pass
                 else:
                     # Se uma mensagem de dados for recebida antes do handshake completo, a bufferiza.
@@ -193,9 +194,9 @@ class MsgHandler(threading.Thread):
                         key = (addr[0], PEER_UDP_PORT, received_msg["msg_id"])
                         if key in pending_acks:
                             del pending_acks[key] # Remove da lista de pendentes
-                            # print(f"[{time.time()}] ACK for {received_msg['original_type']} msg {received_msg['msg_id']} received from {addr[0]}.") # Descomente para debug se necessário
-                        # else:
-                            # print(f"[{time.time()}] Warning: Received ACK for unknown message {received_msg['msg_id']} from {addr[0]}") # Descomente para debug se necessário
+                            print(f"[{time.time()}] Peer {myself} RECEIVED and REMOVED ACK for msg ID {received_msg['msg_id']} from {addr[0]} (Original: {received_msg['original_type']}). Pending ACKs count: {len(pending_acks)}") # Modificado
+                        else:
+                            print(f"[{time.time()}] Peer {myself} WARNING: Received ACK for UNKNOWN msg ID {received_msg['msg_id']} from {addr[0]} (Original: {received_msg['original_type']}). Already processed or never sent?") # Modificado
                     increment_logical_clock(received_msg["clock"]) # Atualiza relógio com base no ACK
                     continue
 
@@ -215,6 +216,7 @@ class MsgHandler(threading.Thread):
                     # Envia ACK imediatamente para o remetente
                     ack_msg = {"type": "ACK", "msg_id": received_msg["msg_id"], "clock": increment_logical_clock(), "original_type": "DATA"}
                     sendSocket.sendto(pickle.dumps(ack_msg), addr)
+                    print(f"[{time.time()}] Peer {myself} SENT ACK for DATA msg {received_msg['message_number']} (ID: {received_msg['msg_id']}) to {addr[0]}.") # Adicionado
 
                     # Atualiza relógio lógico com base na mensagem de dados recebida
                     increment_logical_clock(received_msg["clock"])
@@ -283,7 +285,7 @@ class MsgHandler(threading.Thread):
                         with unordered_messages_lock:
                             # Armazena (clock, sender_id) para ordenação no heapq, e a mensagem completa
                             heapq.heappush(unordered_received_messages, (received_msg["clock"], received_msg["sender_id"], received_msg))
-                        print(f"[{time.time()}] Peer {myself} BUFFERING OUT-OF-ORDER: ({received_msg['sender_id']}, {received_msg['message_number']}, Clock: {received_msg['clock']}) Expected: {expected_logical_clock_from_peer.get(sender_ip, 0)}")
+                        print(f"[{time.time()}] Peer {myself} BUFFERING OUT-OF-ORDER: ({received_msg['sender_id']}, {received_msg['message_number']}, Clock: {received_msg['clock']}) Expected: {expected_logical_clock_from_peer.get(sender_ip, 0)})")
 
                 elif received_msg["type"] == "STOP":
                     stopCount += 1
@@ -332,19 +334,24 @@ class AcknowledgeMonitor(threading.Thread):
 
     def run(self):
         while True:
-            time.sleep(ACK_TIMEOUT)
+            # Não use ACK_TIMEOUT diretamente aqui para o sleep,
+            # ou ele pode ser muito longo. Use um valor menor para o monitor ser ágil.
+            time.sleep(0.05) # Checa a cada 50ms
+
             with pending_acks_lock: # Protege o dicionário de ACKs pendentes
                 current_time = time.time()
                 keys_to_remove = []
+                # print(f"[{time.time()}] ACK Monitor (Peer {myself}): Checking {len(pending_acks)} pending ACKs.") # Descomente para ver mais logs do monitor
+
                 for key, data in pending_acks.items():
-                    if current_time - data["timestamp"] > ACK_TIMEOUT:
+                    if current_time - data["timestamp"] > ACK_TIMEOUT: # Usa o ACK_TIMEOUT do constMPT
                         if data["retries"] < MAX_RETRIES:
-                            print(f"[{time.time()}] Retransmitting message {key[2]} of type {data['message']['type']} to {key[0]} (retry {data['retries'] + 1})")
+                            print(f"[{time.time()}] Peer {myself} Retransmitting msg ID {key[2]} of type {data['message']['type']} to {key[0]} (retry {data['retries'] + 1}).")
                             sendSocket.sendto(pickle.dumps(data["message"]), (key[0], key[1]))
                             data["timestamp"] = current_time
                             data["retries"] += 1
                         else:
-                            print(f"[{time.time()}] Failed to send message {key[2]} of type {data['message']['type']} to {key[0]} after {MAX_RETRIES} retries. Giving up.")
+                            print(f"[{time.time()}] Peer {myself} FAILED to send msg ID {key[2]} of type {data['message']['type']} to {key[0]} after {MAX_RETRIES} retries. Giving up. This msg will likely cause discrepancy.") # Modificado
                             keys_to_remove.append(key)
                 for key in keys_to_remove:
                     del pending_acks[key]
@@ -423,7 +430,7 @@ while True:
     print(f'[{time.time()}] Sending {nMsgs} data messages to peers...')
     for msgNumber in range(0, nMsgs):
         # Aumentamos o atraso aleatório para simular melhor o tráfego de rede e reduzir a "pressão"
-        time.sleep(random.uniform(0.05, 0.2)) # Atraso entre 50ms e 200ms
+        time.sleep(random.uniform(0.1, 0.5)) # Atraso entre 100ms e 500ms
 
         current_clock = increment_logical_clock()
         msg_id = generate_message_id()
