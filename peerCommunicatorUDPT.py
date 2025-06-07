@@ -185,14 +185,18 @@ class MsgHandler(threading.Thread):
                         break # Sai do loop de entrega para reavaliar na próxima mensagem recebida.
                 # --- FIM DA LÓGICA DE ENTREGA CORRIGIDA ---
 
-        logFile = open('logfile' + str(self.myself_id) + '.log', 'w')
-        logFile.writelines(str(sorted(self.logList, key=lambda x: x[2])))
-        logFile.close()
+        # --- Trecho alterado para imprimir o log no console ---
+        print(f"\n--- FINAL LOG FOR PEER {self.myself_id} ---")
+        # O logList é ordenado pelo Lamport timestamp (x[2]) e depois pelo ID do remetente (x[0])
+        final_sorted_log = sorted(self.logList, key=lambda x: (x[2], x[0]))
+        print(str(final_sorted_log))
+        print(f"--- END FINAL LOG FOR PEER {self.myself_id} ---\n")
+        # --- Fim do trecho alterado ---
 
         print('Sending the list of messages to the server for comparison...')
         clientSock = socket(AF_INET, SOCK_STREAM)
         clientSock.connect((SERVER_ADDR, SERVER_PORT))
-        msgPack = pickle.dumps(sorted(self.logList, key=lambda x: x[2]))
+        msgPack = pickle.dumps(final_sorted_log) # Usa o log já ordenado para enviar ao servidor
         clientSock.send(msgPack)
         clientSock.close()
 
