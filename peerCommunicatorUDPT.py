@@ -16,7 +16,7 @@ logical_clock = 0 # Relógio lógico de Lamport
 # chave: (dest_ip, dest_port, msg_id), valor: {"message": msg, "timestamp": last_sent_time, "retries": num_retries}
 pending_acks = {}
 # Fila de mensagens recebidas fora de ordem, esperando suas dependências.
-# Armazenará tuplas: (logical_clock_from_message, sender_id, message_number, full_message_dict)
+# Armazenará tuplas: (logical_clock_from_message, sender_id, full_message_dict)
 unordered_received_messages = []
 # O log final de mensagens recebidas em ordem. Cada entrada será:
 # (clock_da_mensagem, sender_id_da_mensagem, message_number_da_mensagem) para garantir ordenação total
@@ -25,7 +25,8 @@ received_messages_log = []
 # Ajuda a identificar mensagens fora de ordem.
 expected_logical_clock_from_peer = {}
 # Conjunto para rastrear IDs de mensagens já processadas para evitar duplicatas (Idempotência)
-processed_msg_ids = set() # Armazena tuplas: (sender_id, message_number, msg_id)
+# Armazena tuplas: (sender_id, message_number, msg_id)
+processed_msg_ids = set()
 
 
 # --- Sockets ---
@@ -48,29 +49,29 @@ processed_msg_ids_lock = threading.Lock() # Protege o conjunto de IDs de mensage
 def get_public_ip():
     """Obtém o endereço IP público da máquina."""
     ipAddr = get('https://api.ipify.org').content.decode('utf8')
-    print('My public IP address is: {}'.format(ipAddr))
+    # print('My public IP address is: {}'.format(ipAddr)) # Descomente para debug se necessário
     return ipAddr
 
 def registerWithGroupManager():
     """Registra este peer com o Group Manager."""
     clientSock = socket(AF_INET, SOCK_STREAM)
-    print ('Connecting to group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
+    print (f'[{time.time()}] Connecting to group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
     clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
     ipAddr = get_public_ip()
     req = {"op":"register", "ipaddr":ipAddr, "port":PEER_UDP_PORT}
     msg = pickle.dumps(req)
-    print ('Registering with group manager: ', req)
+    print (f'[{time.time()}] Registering with group manager: ', req)
     clientSock.send(msg)
     clientSock.close()
 
 def getListOfPeers():
     """Obtém a lista de IPs de todos os peers registrados do Group Manager."""
     clientSock = socket(AF_INET, SOCK_STREAM)
-    print ('Connecting to group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
+    print (f'[{time.time()}] Connecting to group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
     clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
     req = {"op":"list"}
     msg = pickle.dumps(req)
-    print ('Getting list of peers from group manager: ', req)
+    print (f'[{time.time()}] Getting list of peers from group manager: ', req)
     clientSock.send(msg)
     msg = clientSock.recv(2048)
     clientSock.close()
@@ -134,18 +135,15 @@ class MsgHandler(threading.Thread):
         print(f'[{time.time()}] Handler is ready. Waiting for the handshakes...')
 
         # Declarar variáveis globais que serão modificadas dentro desta thread.
-        # Mesmo que já declaradas em outras partes, é boa prática para clareza
-        # e para evitar `SyntaxError`s em cenários complexos de threading.
         global handShakeCount
         global logical_clock
-        global PEERS # Usado para obter IPs dos peers
+        global PEERS
         global unordered_received_messages
         global received_messages_log
         global expected_logical_clock_from_peer
         global processed_msg_ids
 
         # Inicializa expected_logical_clock_from_peer para todos os peers conhecidos.
-        # Isso garante que saibamos qual relógio lógico esperar de cada remetente.
         current_peers_ips = getListOfPeers()
         my_current_ip = get_public_ip()
         for peer_ip in current_peers_ips:
@@ -172,6 +170,7 @@ class MsgHandler(threading.Thread):
                     print(f"[{time.time()}] Received non-handshake message from {addr[0]} during handshake phase. Buffering.")
                     # A tupla aqui inclui clock, sender_id e a mensagem completa para futura ordenação total
                     with unordered_messages_lock:
+                        # Armazena (clock, sender_id) para ordenação no heapq, e a mensagem completa
                         heapq.heappush(unordered_received_messages, (msg["clock"], msg["sender_id"], msg))
 
             except timeout:
@@ -194,9 +193,9 @@ class MsgHandler(threading.Thread):
                         key = (addr[0], PEER_UDP_PORT, received_msg["msg_id"])
                         if key in pending_acks:
                             del pending_acks[key] # Remove da lista de pendentes
-                            # print(f"[{time.time()}] ACK for {received_msg['original_type']} msg {received_msg['msg_id']} received from {addr[0]}.")
+                            # print(f"[{time.time()}] ACK for {received_msg['original_type']} msg {received_msg['msg_id']} received from {addr[0]}.") # Descomente para debug se necessário
                         # else:
-                            # print(f"[{time.time()}] Warning: Received ACK for unknown message {received_msg['msg_id']} from {addr[0]}")
+                            # print(f"[{time.time()}] Warning: Received ACK for unknown message {received_msg['msg_id']} from {addr[0]}") # Descomente para debug se necessário
                     increment_logical_clock(received_msg["clock"]) # Atualiza relógio com base no ACK
                     continue
 
@@ -263,7 +262,7 @@ class MsgHandler(threading.Thread):
                             for msg_tuple in remaining_messages:
                                 heapq.heappush(unordered_received_messages, msg_tuple)
 
-                            # Processa as mensagens que agora estão em ordem (já estão ordenadas pelo sorted no critério Lamport+ID)
+                            # Processa as mensagens que agora estão em ordem
                             # sorted() irá ordenar primeiro pelo clock, e depois pelo sender_id (segundo elemento da tupla)
                             for clock_val, sender_id_val, ordered_msg in sorted(processable_messages):
                                 with processed_msg_ids_lock:
@@ -282,6 +281,7 @@ class MsgHandler(threading.Thread):
                     else:
                         # Mensagem fora de ordem, armazena na fila de desordenados para processamento futuro
                         with unordered_messages_lock:
+                            # Armazena (clock, sender_id) para ordenação no heapq, e a mensagem completa
                             heapq.heappush(unordered_received_messages, (received_msg["clock"], received_msg["sender_id"], received_msg))
                         print(f"[{time.time()}] Peer {myself} BUFFERING OUT-OF-ORDER: ({received_msg['sender_id']}, {received_msg['message_number']}, Clock: {received_msg['clock']}) Expected: {expected_logical_clock_from_peer.get(sender_ip, 0)}")
 
@@ -372,7 +372,7 @@ registerWithGroupManager()
 
 # Inicia o monitor de ACKs em uma thread separada
 ack_monitor = AcknowledgeMonitor()
-ack_monitor.daemon = True
+ack_monitor.daemon = True # Torna a thread um daemon para que ela termine quando o programa principal terminar
 ack_monitor.start()
 
 while True:
@@ -422,7 +422,8 @@ while True:
     # Envia uma sequência de mensagens de dados para todos os outros peers
     print(f'[{time.time()}] Sending {nMsgs} data messages to peers...')
     for msgNumber in range(0, nMsgs):
-        time.sleep(random.randrange(10,100)/1000) # Pequeno atraso aleatório para simular tráfego de rede
+        # Aumentamos o atraso aleatório para simular melhor o tráfego de rede e reduzir a "pressão"
+        time.sleep(random.uniform(0.05, 0.2)) # Atraso entre 50ms e 200ms
 
         current_clock = increment_logical_clock()
         msg_id = generate_message_id()
@@ -433,7 +434,7 @@ while True:
             with pending_acks_lock:
                 pending_acks[(addrToSend, PEER_UDP_PORT, msg_id)] = {"message": msg_to_send, "timestamp": time.time(), "retries": 0}
             sendSocket.sendto(msgPack, (addrToSend, PEER_UDP_PORT))
-        # print(f"[{time.time()}] Sent DATA msg {msgNumber} with clock {current_clock} (ID: {msg_id})")
+        # print(f"[{time.time()}] Sent DATA msg {msgNumber} with clock {current_clock} (ID: {msg_id})") # Descomente para debug se necessário
 
     # Espera até que todos os ACKs para as mensagens de dados sejam recebidos (ou as retransmissões falhem)
     print(f'[{time.time()}] Waiting for all data message ACKs to be confirmed...')
