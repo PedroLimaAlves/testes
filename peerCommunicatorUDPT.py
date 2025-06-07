@@ -12,7 +12,7 @@ PEERS = []
 lamport_clock = 0
 msgQueue = []
 delivered = set()
-acks_received = {}
+acks_received = {} # Esta variável agora é usada principalmente para o SENT_MESSAGES.
 
 SENT_MESSAGES = {}
 RETRANSMISSION_TIMEOUT = 2.0
@@ -155,19 +155,35 @@ class MsgHandler(threading.Thread):
                             print(f"Message {data_id} fully acknowledged by all peers.")
                             del SENT_MESSAGES[data_id]
 
-                new_msgQueue = []
-                for entry in sorted(msgQueue, key=lambda x: (x[2], x[0])):
-                    sender_id, msg_number, msg_time = entry
+                # --- INÍCIO DA LÓGICA DE ENTREGA CORRIGIDA ---
+                while True:
+                    if not msgQueue:
+                        break
+
+                    # Garante que a fila está sempre ordenada pelo relógio de Lamport e ID do remetente
+                    msgQueue.sort(key=lambda x: (x[2], x[0]))
+
+                    entry_to_deliver = msgQueue[0]
+                    sender_id, msg_number, msg_time = entry_to_deliver
                     key = (sender_id, msg_number)
 
-                    if len(acks_received.get(key, set())) == (N - 1):
-                        if key not in delivered:
-                            delivered.add(key)
-                            print(f"--- Delivered message {msg_number} from process {sender_id} (Lamport: {msg_time}) ---")
+                    if key not in delivered:
+                        # Se a mensagem com menor Lamport não foi entregue, entregue-a.
+                        # Não há mais a condição de esperar por ACKs de outros peers aqui.
+                        delivered.add(key)
+                        print(f"--- Delivered message {msg_number} from process {sender_id} (Lamport: {msg_time}) ---")
+                        msgQueue.pop(0) # Remove a mensagem entregue da fila
                     else:
-                        new_msgQueue.append(entry)
-
-                msgQueue[:] = new_msgQueue
+                        # Se a mensagem no topo já foi entregue (duplicata ou erro), remove e tenta a próxima.
+                        print(f"--- Warning: Message {key} already delivered. Removing from queue. ---")
+                        msgQueue.pop(0)
+                        # Se a mensagem que está no topo já foi entregue,
+                        # é um caso atípico, mas podemos continuar para o próximo item
+                        # ou, de forma mais cautelosa, quebrar o loop e reavaliar
+                        # na próxima iteração de recebimento de mensagens.
+                        # Optamos por quebrar para evitar loops infinitos se houver um erro de lógica mais profundo.
+                        break # Sai do loop de entrega para reavaliar na próxima mensagem recebida.
+                # --- FIM DA LÓGICA DE ENTREGA CORRIGIDA ---
 
         logFile = open('logfile' + str(self.myself_id) + '.log', 'w')
         logFile.writelines(str(sorted(self.logList, key=lambda x: x[2])))
