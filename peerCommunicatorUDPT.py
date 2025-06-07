@@ -4,23 +4,22 @@ import threading
 import random
 import pickle
 from requests import get
-import time #time.time() é usado, time.sleep() é removido
+import time
 
 handShakeCount = 0
 
 PEERS = []
 lamport_clock = 0
-msgQueue = []
-delivered = set()
+msgQueue = [] # Armazena (sender_id, msg_number, msg_time_original)
+delivered = set() # Armazena (sender_id, msg_number) para evitar duplicatas
 
 SENT_MESSAGES = {}
 RETRANSMISSION_TIMEOUT = 2.0
 MAX_RETRANSMISSIONS = 5
 
-data_lock = threading.Lock() # Lock geral para dados compartilhados
-retransmission_condition = threading.Condition(data_lock) # Condição para o RetransmissionHandler
+data_lock = threading.Lock()
+retransmission_condition = threading.Condition(data_lock)
 
-# Eventos para sincronização entre threads (ainda relevantes para o fluxo principal)
 handshake_complete_event = threading.Event()
 all_sent_acked_event = threading.Event()
 
@@ -68,64 +67,51 @@ class RetransmissionHandler(threading.Thread):
         self.running = True
 
     def run(self):
-        with retransmission_condition: # Adquire o lock antes de começar o loop
+        with retransmission_condition:
             while self.running:
                 current_time = time.time()
-                next_timeout = float('inf') # O próximo timeout mais cedo
+                next_timeout = float('inf')
 
-                # Verifica se há mensagens para retransmitir e calcula o próximo timeout
                 messages_to_retransmit = []
-                for msg_id, data in list(SENT_MESSAGES.items()): # Copia a lista para iterar com segurança
+                for msg_id, data in list(SENT_MESSAGES.items()):
                     if (current_time - data["sent_time"]) > RETRANSMISSION_TIMEOUT:
                         messages_to_retransmit.append((msg_id, data))
                     else:
-                        # Calcula quanto tempo falta para o próximo timeout
                         time_left = RETRANSMISSION_TIMEOUT - (current_time - data["sent_time"])
                         if time_left < next_timeout:
                             next_timeout = time_left
                 
-                # Processa as mensagens que precisam ser retransmitidas
                 for msg_id, data in messages_to_retransmit:
                     if data["retries"] < MAX_RETRANSMISSIONS:
                         print(f"--- Retransmitting message {msg_id}, retry {data['retries'] + 1} ---")
-                        # O reenvio precisa ser feito fora do data_lock se sendSocket for bloqueante
-                        # Mas como é UDP e sendto não bloqueia muito, manter o lock por agora
                         for addrToSend in PEERS:
                             sendSocket.sendto(data["msg_packed"], (addrToSend, PEER_UDP_PORT))
-                        data["sent_time"] = time.time() # Atualiza tempo de envio
+                        data["sent_time"] = time.time()
                         data["retries"] += 1
-                        # Atualiza next_timeout para esta mensagem após retransmissão
-                        if RETRANSMISSION_TIMEOUT < next_timeout:
-                            next_timeout = RETRANSMISSION_TIMEOUT # A próxima retransmissão desta msg
-
+                        if RETRANSMISSION_TIMEOUT < next_timeout: # Atualiza next_timeout para a próxima tentativa desta mensagem
+                            next_timeout = RETRANSMISSION_TIMEOUT
                     else:
                         print(f"--- Message {msg_id} failed after {MAX_RETRANSMISSIONS} retries. ---")
                         del SENT_MESSAGES[msg_id]
                         if not SENT_MESSAGES:
-                            all_sent_acked_event.set() # Sinaliza que todas as mensagens falharam ou foram ACKadas
+                            all_sent_acked_event.set()
 
-                # Se não há mensagens para monitorar, ou todas falharam/ACKadas, esperar indefinidamente
                 if not SENT_MESSAGES:
-                    next_timeout = None # Espera indefinidamente até ser notificado
+                    next_timeout = None
 
-                # Espera pelo próximo timeout ou por uma notificação
-                # Se next_timeout for None, wait() bloqueia até notify()
-                # Se next_timeout for um valor, wait() bloqueia por esse tempo ou até notify()
                 retransmission_condition.wait(next_timeout)
-                # O lock é liberado durante o wait() e readquirido ao retornar
 
     def stop(self):
         with retransmission_condition:
             self.running = False
-            retransmission_condition.notify_all() # Acorda a thread para que ela possa terminar
+            retransmission_condition.notify_all()
 
 class MsgHandler(threading.Thread):
     def __init__(self, sock, myself_id):
         threading.Thread.__init__(self)
         self.sock = sock
         self.myself_id = myself_id
-        self.logList = []
-        # Eventos compartilhados
+        self.logList = [] # Store (sender_id, msg_number, lamport_at_delivery)
         self.handshake_event = handshake_complete_event
         self.acked_event = all_sent_acked_event
 
@@ -133,14 +119,12 @@ class MsgHandler(threading.Thread):
         print('Handler is ready. Waiting for the handshakes...')
         global handShakeCount, lamport_clock, msgQueue, delivered
 
-        with data_lock: # Usa o data_lock para resetar estados compartilhados
+        with data_lock:
             lamport_clock = 0
             msgQueue = []
             delivered = set()
             self.logList = []
 
-        # Loop de Handshake
-        # A thread bloqueia em recv() até receber um handshake
         while handShakeCount < N:
             msgPack = self.sock.recv(4096)
             with data_lock:
@@ -149,14 +133,14 @@ class MsgHandler(threading.Thread):
                     handShakeCount += 1
                     print(f'--- Handshake received: {msg[1]} (Count: {handShakeCount}/{N}) ---')
                     if handShakeCount == N:
-                        self.handshake_event.set() # Sinaliza que todos os handshakes foram recebidos
+                        self.handshake_event.set()
 
         print('Secondary Thread: Received all handshakes. Entering the loop to receive messages.')
 
         stopCount = 0
         while True:
-            msgPack = self.sock.recv(4096) # Bloqueia aqui esperando por mensagens
-            with data_lock: # Adquire o lock para processar a mensagem recebida
+            msgPack = self.sock.recv(4096)
+            with data_lock:
                 msg = pickle.loads(msgPack)
 
                 if msg[0] == -1:
@@ -166,23 +150,21 @@ class MsgHandler(threading.Thread):
                         break
                     continue
 
-                recv_clock = msg[-1]
-                lamport_clock = max(lamport_clock, recv_clock) + 1
+                recv_clock = msg[-1] # Lamport do remetente
+                lamport_clock = max(lamport_clock, recv_clock) + 1 # Atualiza o relógio do receptor
 
                 if msg[0] == "DATA":
-                    sender_id, msg_number, msg_time = msg[1], msg[2], msg[3]
+                    sender_id, msg_number, msg_time_original = msg[1], msg[2], msg[3]
                     key = (sender_id, msg_number)
 
                     if key not in delivered:
-                        print(f'Message {msg_number} from process {sender_id} received. Lamport: {lamport_clock}')
-                        self.logList.append((sender_id, msg_number, msg_time))
-                        msgQueue.append((sender_id, msg_number, msg_time))
+                        # Adiciona a mensagem à fila com o Lamport ORIGINAL para ordenação
+                        msgQueue.append((sender_id, msg_number, msg_time_original))
+                        print(f'Message {msg_number} from process {sender_id} received. Original Lamport: {msg_time_original}, Current Peer Lamport: {lamport_clock}')
 
-                        lamport_clock += 1
+                        lamport_clock += 1 # Incrementa o relógio antes de enviar o ACK
                         ack = pickle.dumps(("ACK", self.myself_id, key, lamport_clock))
                         try:
-                            # Send ACK. Note: sendto should be fine, but if it blocks,
-                            # consider moving it outside the lock briefly.
                             sendSocket.sendto(ack, (PEERS[sender_id], PEER_UDP_PORT))
                             print(f"Sent ACK for message {key} to {PEERS[sender_id]}")
                         except Exception as e:
@@ -198,38 +180,47 @@ class MsgHandler(threading.Thread):
                         if len(SENT_MESSAGES[data_id]["recipients_acked"]) == (N - 1):
                             print(f"Message {data_id} fully acknowledged by all peers.")
                             del SENT_MESSAGES[data_id]
-                            # Notifica a thread de retransmissão sobre uma mudança no SENT_MESSAGES
-                            # para que ela possa reavaliar seus timers ou terminar se tudo foi ackado
-                            retransmission_condition.notify() 
+                            retransmission_condition.notify()
                             if not SENT_MESSAGES:
                                 self.acked_event.set()
 
-                # Lógica de entrega (correção anterior, sem sleeps)
+                # Lógica de entrega
                 while True:
                     if not msgQueue:
                         break
 
-                    msgQueue.sort(key=lambda x: (x[2], x[0])) # Garante ordenação
+                    # Ordena a fila usando o Lamport ORIGINAL da mensagem (x[2]) e o ID do remetente (x[0])
+                    msgQueue.sort(key=lambda x: (x[2], x[0]))
                     entry_to_deliver = msgQueue[0]
-                    sender_id, msg_number, msg_time = entry_to_deliver
+                    
+                    sender_id, msg_number, msg_time_original = entry_to_deliver # Valores da mensagem na fila
                     key = (sender_id, msg_number)
 
                     if key not in delivered:
+                        # Incrementa o relógio do peer ANTES de entregar a mensagem
+                        # O Lamport de entrega é o valor do relógio DO RECEPTOR no momento da entrega
+                        lamport_at_delivery = lamport_clock + 1 # Usa o valor atual do relógio + 1 para a entrega
+                        lamport_clock = lamport_at_delivery # Atualiza o relógio do peer
+
                         delivered.add(key)
-                        print(f"--- Delivered message {msg_number} from process {sender_id} (Lamport: {msg_time}) ---")
-                        self.logList.append(entry_to_deliver) # Certifica-se de que a mensagem entregue é adicionada ao log
+                        # Adiciona ao log a mensagem com o Lamport do peer RECEPTOR NO MOMENTO DA ENTREGA
+                        self.logList.append((sender_id, msg_number, lamport_at_delivery))
+                        print(f"--- Delivered message {msg_number} from process {sender_id} (Delivered Lamport: {lamport_at_delivery}, Original Lamport: {msg_time_original}) ---")
                         msgQueue.pop(0)
                     else:
                         print(f"--- Warning: Message {key} already delivered. Removing from queue. ---")
                         msgQueue.pop(0)
-                        break
+                        # Se o item no topo já foi entregue, continue para o próximo
+                        # para garantir que o loop de entrega não pare por um item inválido.
+                        # Nao precisa de break aqui.
+                        continue # Reavalia o loop de entrega com o próximo item na fila
 
-        # --- Trecho alterado para imprimir o log no console ---
+
         print(f"\n--- FINAL LOG FOR PEER {self.myself_id} ---")
+        # O log final é ordenado pelo Lamport de entrega (x[2])
         final_sorted_log = sorted(self.logList, key=lambda x: (x[2], x[0]))
         print(str(final_sorted_log))
         print(f"--- END FINAL LOG FOR PEER {self.myself_id} ---\n")
-        # --- Fim do trecho alterado ---
 
         print('Sending the list of messages to the server for comparison...')
         clientSock = socket(AF_INET, SOCK_STREAM)
@@ -272,8 +263,7 @@ while 1:
         SENT_MESSAGES.clear()
         handshake_complete_event.clear()
         all_sent_acked_event.clear()
-        # Notifica a thread de retransmissão para que ela reavalie (agora com SENT_MESSAGES vazio)
-        retransmission_condition.notify()
+        retransmission_condition.notify() # Notifica a thread de retransmissão para reavaliar (agora vazio)
 
     msgHandler = MsgHandler(recvSocket, myself)
     msgHandler.start()
@@ -294,9 +284,9 @@ while 1:
 
     for msgNumber in range(0, nMsgs):
         with data_lock:
-            lamport_clock += 1
+            lamport_clock += 1 # Incrementa o relógio antes de enviar sua própria mensagem
             msg_id = (myself, msgNumber)
-            msg = ("DATA", myself, msgNumber, lamport_clock)
+            msg = ("DATA", myself, msgNumber, lamport_clock) # O Lamport aqui é o "Lamport original" da mensagem
             msgPack = pickle.dumps(msg)
 
             SENT_MESSAGES[msg_id] = {
@@ -305,8 +295,7 @@ while 1:
                 "sent_time": time.time(),
                 "retries": 0
             }
-            # Notifica a thread de retransmissão que há uma nova mensagem para monitorar
-            retransmission_condition.notify()
+            retransmission_condition.notify() # Notifica a thread de retransmissão
 
             for addrToSend in PEERS:
                 sendSocket.sendto(msgPack, (addrToSend, PEER_UDP_PORT))
@@ -314,7 +303,7 @@ while 1:
 
     print(f"Waiting for all sent messages to be acknowledged...")
     with data_lock:
-        if not SENT_MESSAGES:
+        if not SENT_MESSAGES and all_sent_acked_event.is_set(): # Verifica se já está setado ou vazio
             print("No messages to wait for or already acknowledged.")
         else:
             all_sent_acked_event.wait()
