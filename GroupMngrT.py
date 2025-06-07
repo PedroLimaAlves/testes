@@ -1,6 +1,6 @@
 from socket import *
 import pickle
-from constMP2 import *
+from constMPT import *
 
 port = GROUPMNGR_TCP_PORT
 membership = []
