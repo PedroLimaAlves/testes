@@ -1,7 +1,7 @@
 PEER_UDP_PORT = 6789
 PEER_TCP_PORT = 5679
-N = 2  # número de pares (ajuste conforme o número real)
-SERVER_ADDR = '3.91.49.60'
+N = 2
+SERVER_ADDR ='3.91.49.60'
 SERVER_PORT = 5678
 GROUPMNGR_ADDR = '3.86.160.186'
 GROUPMNGR_TCP_PORT = 5680
