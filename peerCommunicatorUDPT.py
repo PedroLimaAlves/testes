@@ -94,15 +94,15 @@ class MsgHandler(threading.Thread):
         global PEERS # Necessário para inicializar expected_logical_clock_from_peer
         global unordered_received_messages
         global received_messages_log
+        global expected_logical_clock_from_peer # Adicionado aqui para o escopo do método
 
         # Inicializa expected_logical_clock_from_peer para todos os peers
-        for peer_ip in PEERS:
-            # PEERS é uma lista de IPs, precisamos do ID do peer
-            # Isso é um ponto fraco do design original, pois o IP não é um ID de peer direto
-            # Assumindo que o ID do peer é o índice na lista PEERS para simplificação neste exemplo
-            # Em um sistema real, você teria um mapeamento de IP para ID ou um ID único no registro
-            # Por enquanto, usaremos o IP como uma chave para o dicionário
-            if peer_ip != get_public_ip(): # Não esperamos mensagens de nós mesmos
+        # A lista PEERS é uma lista de IPs. Para o expected_logical_clock_from_peer,
+        # usaremos o IP como chave.
+        current_peers_ips = getListOfPeers() # Pega a lista mais recente
+        my_current_ip = get_public_ip()
+        for peer_ip in current_peers_ips:
+            if peer_ip != my_current_ip: # Não esperamos mensagens de nós mesmos
                 expected_logical_clock_from_peer[peer_ip] = 0
 
         # Wait until handshakes are received from all other processes
@@ -119,16 +119,18 @@ class MsgHandler(threading.Thread):
                     print(f'--- Handshake received from {addr[0]}. Total handshakes: {handShakeCount}')
                 elif msg["type"] == 'ACK' and msg["original_type"] == 'READY':
                     # This peer sent a handshake and received an ACK. Don't increment handShakeCount.
-                    pass
+                    pass # Já é tratado na thread principal
                 else:
                     # Se receber uma mensagem de dados antes do handshake completo, guarda na fila de desordenados
-                    # e tenta processar mais tarde.
                     print(f"Received non-handshake message from {addr[0]} during handshake phase. Buffering.")
                     with unordered_messages_lock:
                         heapq.heappush(unordered_received_messages, (msg["clock"], msg))
 
             except timeout:
-                continue # Continua esperando handshakes
+                continue
+            except Exception as e:
+                print(f"Error during handshake in MsgHandler: {e}")
+                continue
 
         print('Secondary Thread: Received all handshakes. Entering the loop to receive messages.')
 
@@ -140,7 +142,6 @@ class MsgHandler(threading.Thread):
 
                 # Processar ACKs
                 if received_msg["type"] == "ACK":
-                    # print(f"Received ACK for msg_id: {received_msg['msg_id']} from {addr[0]}")
                     with pending_acks_lock:
                         key = (addr[0], PEER_UDP_PORT, received_msg["msg_id"])
                         if key in pending_acks:
@@ -149,7 +150,7 @@ class MsgHandler(threading.Thread):
                             print(f"Warning: Received ACK for unknown message {received_msg['msg_id']} from {addr[0]}")
                     # Atualiza o relógio lógico com base no ACK
                     increment_logical_clock(received_msg["clock"])
-                    continue # Não processa ACKs como mensagens de dados
+                    continue
 
                 # Processar mensagens de dados
                 if received_msg["type"] == "DATA":
@@ -158,47 +159,57 @@ class MsgHandler(threading.Thread):
                     sendSocket.sendto(pickle.dumps(ack_msg), addr)
 
                     # Atualiza o relógio lógico com base na mensagem recebida
-                    current_peer_clock = increment_logical_clock(received_msg["clock"])
+                    increment_logical_clock(received_msg["clock"])
 
                     print(f'Message {received_msg["message_number"]} from process {received_msg["sender_id"]} (Clock: {received_msg["clock"]})')
 
-                    # Verifica se a mensagem está em ordem
-                    # Para simplificar, assumimos que o sender_id é o próprio IP do remetente
-                    sender_ip = received_msg["sender_ip"] # Adicionamos sender_ip ao dicionário de mensagem
+                    sender_ip = received_msg["sender_ip"]
                     if sender_ip not in expected_logical_clock_from_peer:
-                        expected_logical_clock_from_peer[sender_ip] = received_msg["clock"] # Inicializa
+                        expected_logical_clock_from_peer[sender_ip] = 0 # Inicializa se for a primeira mensagem deste remetente
                     
                     if received_msg["clock"] >= expected_logical_clock_from_peer[sender_ip]:
                         # A mensagem está em ordem ou é posterior ao esperado.
-                        # Processa a mensagem e tenta processar as mensagens da fila de desordenados.
                         with log_list_lock:
                             received_messages_log.append((received_msg["sender_id"], received_msg["message_number"], received_msg["clock"]))
-                        expected_logical_clock_from_peer[sender_ip] = received_msg["clock"] + 1 # Atualiza o relógio esperado para o remetente
+                        expected_logical_clock_from_peer[sender_ip] = received_msg["clock"] + 1
 
                         # Tenta processar mensagens da fila de desordenados
                         with unordered_messages_lock:
-                            while unordered_received_messages and \
-                                  unordered_received_messages[0][0] <= expected_logical_clock_from_peer[unordered_received_messages[0][1]["sender_ip"]]:
-                                # A próxima mensagem na fila (menor relógio) está em ordem ou pode ser processada
-                                ordered_msg_tuple = heapq.heappop(unordered_received_messages)
-                                ordered_msg = ordered_msg_tuple[1]
+                            # Filtra as mensagens que podem ser processadas agora
+                            processable_messages = []
+                            remaining_messages = []
+                            for clock_val, buffered_msg in unordered_received_messages:
+                                buffered_sender_ip = buffered_msg["sender_ip"]
+                                if buffered_sender_ip in expected_logical_clock_from_peer and \
+                                   clock_val >= expected_logical_clock_from_peer[buffered_sender_ip]:
+                                    processable_messages.append((clock_val, buffered_msg))
+                                else:
+                                    remaining_messages.append((clock_val, buffered_msg))
+                            
+                            # Limpa e reconstrói a fila com as mensagens restantes
+                            unordered_received_messages.clear()
+                            for msg_tuple in remaining_messages:
+                                heapq.heappush(unordered_received_messages, msg_tuple)
+
+                            # Processa as mensagens que agora estão em ordem
+                            for clock_val, ordered_msg in sorted(processable_messages):
                                 with log_list_lock:
                                     received_messages_log.append((ordered_msg["sender_id"], ordered_msg["message_number"], ordered_msg["clock"]))
                                 expected_logical_clock_from_peer[ordered_msg["sender_ip"]] = ordered_msg["clock"] + 1
-                                print(f'Processed buffered message {ordered_msg["message_number"]} from process {ordered_msg["sender_id"]}')
+                                print(f'Processed buffered message {ordered_msg["message_number"]} from process {ordered_msg["sender_id"]} (Clock: {ordered_msg["clock"]})')
                     else:
                         # Mensagem fora de ordem, armazena na fila de desordenados
                         with unordered_messages_lock:
                             heapq.heappush(unordered_received_messages, (received_msg["clock"], received_msg))
-                        print(f"Buffering out-of-order message {received_msg['message_number']} from {received_msg['sender_id']} (Clock: {received_msg['clock']}) Expected: {expected_logical_clock_from_peer[sender_ip]}")
+                        print(f"Buffering out-of-order message {received_msg['message_number']} from {received_msg['sender_id']} (Clock: {received_msg['clock']}) Expected: {expected_logical_clock_from_peer.get(sender_ip, 0)}")
 
                 elif received_msg["type"] == "STOP":
                     stopCount += 1
                     print(f"Received STOP from {received_msg['sender_id']}. Total STOPs: {stopCount}")
-                    if stopCount == N - 1: # Todos os outros peers pararam
+                    if stopCount == N - 1:
                         break
             except timeout:
-                continue # Continua esperando mensagens
+                continue
             except Exception as e:
                 print(f"Error in MsgHandler: {e}")
                 continue
@@ -219,22 +230,24 @@ class MsgHandler(threading.Thread):
             msgPack = pickle.dumps(received_messages_log)
         clientSock.send(msgPack)
         clientSock.close()
-
-        # Reset the handshake counter
-        global handShakeCount # Redefine para a próxima rodada, se houver
-        handShakeCount = 0
+        
+        # Reset as variáveis globais para a próxima rodada, se a thread for reutilizada
+        # (Neste caso, a thread termina, então os resets são mais para clareza)
+        global handShakeCount
         global logical_clock
-        logical_clock = 0 # Redefine o relógio lógico
         global pending_acks
-        pending_acks = {} # Limpa ACKs pendentes
         global unordered_received_messages
-        unordered_received_messages = [] # Limpa mensagens fora de ordem
         global received_messages_log
-        received_messages_log = [] # Limpa o log
         global expected_logical_clock_from_peer
-        expected_logical_clock_from_peer = {} # Limpa o relógio esperado
 
-        exit(0) # Termina a thread
+        handShakeCount = 0
+        logical_clock = 0
+        pending_acks.clear()
+        unordered_received_messages.clear()
+        received_messages_log.clear()
+        expected_logical_clock_from_peer.clear()
+
+        exit(0)
 
 class AcknowledgeMonitor(threading.Thread):
     def __init__(self):
@@ -242,16 +255,16 @@ class AcknowledgeMonitor(threading.Thread):
 
     def run(self):
         while True:
-            time.sleep(ACK_TIMEOUT) # Verifica a cada ACK_TIMEOUT
+            time.sleep(ACK_TIMEOUT)
             with pending_acks_lock:
                 current_time = time.time()
                 keys_to_remove = []
                 for key, data in pending_acks.items():
                     if current_time - data["timestamp"] > ACK_TIMEOUT:
                         if data["retries"] < MAX_RETRIES:
-                            print(f"Retransmitting message {key[2]} to {key[0]} (retry {data['retries'] + 1})")
+                            # print(f"Retransmitting message {key[2]} to {key[0]} (retry {data['retries'] + 1})")
                             sendSocket.sendto(pickle.dumps(data["message"]), (key[0], key[1]))
-                            data["timestamp"] = current_time # Atualiza o timestamp
+                            data["timestamp"] = current_time
                             data["retries"] += 1
                         else:
                             print(f"Failed to send message {key[2]} to {key[0]} after {MAX_RETRIES} retries. Giving up.")
@@ -292,6 +305,14 @@ while True:
         exit(0)
 
     # Reset handshakes and clocks for a new round
+    # Adicionei essas declarações 'global' para resolver o SyntaxError
+    global handShakeCount
+    global logical_clock
+    global pending_acks
+    global unordered_received_messages
+    global received_messages_log
+    global expected_logical_clock_from_peer
+
     handShakeCount = 0
     logical_clock = 0
     pending_acks.clear()
@@ -299,16 +320,16 @@ while True:
     received_messages_log.clear()
     expected_logical_clock_from_peer.clear()
 
+
     # Create receiving message handler
     msgHandler = MsgHandler(recvSocket)
-    msgHandler.daemon = True # Permite que a thread termine com o programa principal
+    msgHandler.daemon = True
     msgHandler.start()
     print('Handler started')
 
     PEERS = getListOfPeers()
-    # Remove o próprio IP da lista de peers para comunicação
     my_ip = get_public_ip()
-    PEERS = [peer_ip for peer_ip in PEERS if peer_ip != my_ip]
+    PEERS = [peer_ip for peer_ip in PEERS if peer_ip != my_ip] # Remove o próprio IP da lista
 
     # Send handshakes
     for addrToSend in PEERS:
@@ -323,19 +344,14 @@ while True:
         sendSocket.sendto(msgPack, (addrToSend, PEER_UDP_PORT))
 
     # Wait for all handshakes to be acknowledged (or timeout)
-    # A MsgHandler já está contando os handshakes recebidos.
-    # Esta thread principal espera que a MsgHandler finalize o "handshake phase".
-    # Uma maneira mais robusta seria usar um Condition Variable ou Event
-    # para sinalizar quando todos os handshakes foram recebidos.
-    # Por enquanto, usaremos a contagem direta e um pequeno sleep para evitar busy-waiting.
     while handShakeCount < N - 1:
-        time.sleep(0.01) # Pequena pausa para evitar busy-waiting excessivo
+        time.sleep(0.01)
 
     print('Main Thread: Sent all handshakes and confirmed. handShakeCount=', str(handShakeCount))
 
     # Send a sequence of data messages to all other processes
     for msgNumber in range(0, nMsgs):
-        time.sleep(random.randrange(10,100)/1000) # Small random delay
+        time.sleep(random.randrange(10,100)/1000)
 
         current_clock = increment_logical_clock()
         msg_id = generate_message_id()
@@ -346,15 +362,13 @@ while True:
             with pending_acks_lock:
                 pending_acks[(addrToSend, PEER_UDP_PORT, msg_id)] = {"message": msg_to_send, "timestamp": time.time(), "retries": 0}
             sendSocket.sendto(msgPack, (addrToSend, PEER_UDP_PORT))
-            # print(f'Sent message {msgNumber} with clock {current_clock} to {addrToSend}')
 
     # Wait for all pending ACKs for data messages
-    # Isso garante que todas as mensagens foram enviadas com sucesso (ou esgotaram as retries)
     while True:
         with pending_acks_lock:
             if not pending_acks:
                 break
-        time.sleep(0.01) # Wait a bit for ACKs
+        time.sleep(0.01)
 
     # Tell all processes that I have no more messages to send
     print("Sending STOP messages to all peers...")
@@ -363,10 +377,7 @@ while True:
         current_clock = increment_logical_clock()
         msg_to_send = {"type": "STOP", "sender_id": myself, "msg_id": msg_id, "clock": current_clock}
         msgPack = pickle.dumps(msg_to_send)
-        # Não precisamos de ACK para STOP, pois é um sinal final
         sendSocket.sendto(msgPack, (addrToSend, PEER_UDP_PORT))
 
-    # A thread MsgHandler agora deve estar esperando por STOPs ou ter terminado
-    # Espera a MsgHandler terminar de processar e enviar o log.
-    msgHandler.join() # Bloqueia até a MsgHandler thread terminar
+    msgHandler.join()
     print("Main thread: MsgHandler finished. Ready for next round.")
