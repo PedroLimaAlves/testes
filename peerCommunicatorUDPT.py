@@ -1,5 +1,5 @@
 from socket  import *
-from constMP import * #-
+from constMP2 import * #-
 import threading
 import random
 import time
