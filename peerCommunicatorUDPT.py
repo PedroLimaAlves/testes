@@ -93,13 +93,13 @@ class MsgHandler(threading.Thread):
 
     def run(self):
         global handShakeCount
-        global N
+        global N # Importado de constMPT
 
         print('Handler is ready. Waiting for the handshakes...')
 
         # Aguardar handshakes de todos os outros processos
         while handShakeCount < N - 1: # N-1 pois não esperamos handshake de nós mesmos
-            msgPack = self.sock.recv(1024)
+            msgPack, _ = self.sock.recvfrom(1024) # Recebe dados com endereço
             msg = pickle.loads(msgPack)
             if msg[0] == 'READY': # Tipo de mensagem 'READY' para handshake
                 # To do: enviar reply de handshake e esperar confirmação
@@ -122,8 +122,14 @@ class MsgHandler(threading.Thread):
 
             # 2º passo: coloca a mensagem na fila
             with queue_lock:
-                message_queue.append(msg)
-                message_queue.sort(key=lambda x: x[3]) # Ordena pela timestamp de Lamport
+                # Apenas mensagens DATA e ACK são adicionadas para ordenação e ACK
+                # STOP e READY não precisam de ordenação na fila principal
+                if msg_type == 'DATA' or msg_type == 'ACK':
+                    message_queue.append(msg)
+                    # Ordena pela timestamp de Lamport. Se timestamps iguais, pela ID do remetente para desempate
+                    message_queue.sort(key=lambda x: (x[3], x[1])) 
+                # else: # Para mensagens STOP ou READY, pode processar diretamente
+                #     pass # Lógica específica se necessário para esses tipos
 
             # 3º passo: Se é mensagem de dados, enviar ACK
             if msg_type == 'DATA':
@@ -134,25 +140,24 @@ class MsgHandler(threading.Thread):
                 print(f'ACK for "{message_data}" from process {sender_id} received with timestamp {received_timestamp}. My clock: {logical_clock}')
                 # Armazena o último ACK para este peer. Isso pode ser usado para depuração ou lógica mais complexa.
                 last_ack_from_peer[sender_id] = received_timestamp
-                # Não é necessário destravamento ou adição à logList para ACKs, eles são apenas para confirmação.
-                continue # Pula para a próxima iteração do loop
+                # ACKs não são entregues à aplicação (logList), são apenas para confirmação.
+                # Não continue, pois precisamos que deliver_ordered_messages() seja chamada para potencialmente destravar.
 
             elif msg_type == 'STOP': # Mensagem de parada
                 stopCount += 1
-                print(f'STOP message from peer {sender_id}. Current stop count: {stopCount}/{N}')
-                if stopCount == N: # N é o número total de peers (incluindo o próprio)
+                print(f'STOP message from peer {sender_id}. Current stop count: {stopCount}/{N-1}') # Log mais claro
+                if stopCount == N - 1: # CORREÇÃO AQUI: Espera N-1 STOPs
                     break # Para o loop quando todos os outros processos finalizaram
 
             # 4º passo: verifica se "destrava" a primeira mensagem da fila e entrega a mensagem para a aplicação
-            # Implementação de entrega ordenada (Lamport)
+            # Chamada após processar a mensagem recebida para tentar entregar mensagens ordenadas
             self.deliver_ordered_messages()
-
 
         # Finaliza o handler e envia logs
         print('Secondary Thread: All STOP messages received. Exiting message reception loop.')
         self.send_logs_to_server()
         handShakeCount = 0 # Reseta o contador de handshakes para um novo ciclo
-        exit(0)
+        # exit(0) # Remover para permitir que o peer espere por um novo sinal do servidor
 
     def deliver_ordered_messages(self):
         global myself
@@ -161,9 +166,11 @@ class MsgHandler(threading.Thread):
         with queue_lock:
             # Continuamente tenta entregar mensagens enquanto a fila não estiver vazia
             # e a primeira mensagem na fila tem o timestamp esperado
+            # Garante que a mensagem é do tipo 'DATA' e que o timestamp e a ID do remetente correspondem
             while message_queue and \
                   message_queue[0][0] == 'DATA' and \
-                  message_queue[0][3] == expected_timestamps.get(message_queue[0][1], 0): # Verifica tipo DATA e timestamp esperada
+                  message_queue[0][1] in expected_timestamps and \
+                  message_queue[0][3] == expected_timestamps[message_queue[0][1]]:
 
                 msg_to_deliver = message_queue.pop(0)
                 msg_type, sender_id, message_data, timestamp = msg_to_deliver
@@ -218,7 +225,7 @@ while 1:
     update_logical_clock()
     # Inicializa o timestamp esperado para cada peer, incluindo ele mesmo
     # (Embora não receba mensagens de si mesmo para ordenação, é bom ter consistência)
-    for i in range(N):
+    for i in range(N): # Itera por todos os IDs de 0 a N-1
         expected_timestamps[i] = 1
 
     # Cria e inicia o manipulador de mensagens de recebimento
@@ -235,9 +242,8 @@ while 1:
 
     # Envia handshakes
     print('Sending handshakes...')
-    # N-1 é o número de outros peers
-    # loop para garantir que os handshakes sejam enviados para todos
-    while handShakeCount < N - 1: # Espera até que todos os handshakes sejam recebidos pelo handler
+    # N-1 é o número de outros peers. O loop deve continuar até que todos os handshakes sejam enviados E recebidos
+    while handShakeCount < N - 1:
         for addrToSend in PEERS:
             send_udp_message(addrToSend, 'READY', myself, 'Handshake')
             print(f'Sent handshake to {addrToSend}. My clock: {logical_clock}')
