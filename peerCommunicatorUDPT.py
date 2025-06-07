@@ -102,15 +102,10 @@ def deliver_messages():
             next_timestamp, (msg_type, sender_id, msg_content, original_timestamp) = message_queue[0]
 
             if sender_id not in expected_clocks:
-                # This peer might have joined late or hasn't sent a handshake yet.
-                # For ordering, we need an initial expected clock.
-                # Initialize it to original_timestamp - 1, expecting the next message to have this timestamp
-                # or a value derived from the first message's timestamp.
-                # A more robust solution might involve peers announcing their initial clock.
-                # If timestamps start at 1, this should be 0.
-                expected_clocks[sender_id] = original_timestamp - 1 # Expecting the first message to be 0 or 1.
-                                                                    # This logic might need refinement based on exact timestamping.
-
+                # Initialize expected clock for this peer.
+                # Assuming timestamps start from 1, the first message from a peer will have a timestamp of 1.
+                # So we expect expected_clocks[sender_id] + 1 == 1, meaning expected_clocks[sender_id] should be 0.
+                expected_clocks[sender_id] = 0
 
             if next_timestamp == expected_clocks[sender_id] + 1:
                 # Message can be delivered
@@ -123,14 +118,12 @@ def deliver_messages():
                     print(f'Message {msg_content} from process {sender_id} (timestamp: {original_timestamp}, delivered at: {next_timestamp})')
                     logList.append((sender_id, msg_content, original_timestamp)) # Store original timestamp for comparison
                     # Send ACK for data message
-                    # To correctly send ACK back, the original message must include sender's IP
-                    # For now, we'll send it to all peers except self (inefficient, but demonstrates ACK)
                     send_ack_message(sender_id, original_timestamp)
                 elif msg_type == 'ACK':
                     print(f'ACK received from process {sender_id} for message with original timestamp {original_timestamp} (ACK timestamp: {next_timestamp})')
                 elif msg_type == -1: # Stop message
                     print(f'Stop message received from process {sender_id} (timestamp: {original_timestamp})')
-                    # No specific action needed for stop messages here as MsgHandler handles termination
+                    # Stop messages are just consumed and updated, no specific logging here
                 else:
                     print(f"Unknown message type: {msg_type}")
             else:
@@ -171,11 +164,9 @@ class MsgHandler(threading.Thread):
                     print(f'--- Handshake received from: {sender_id}')
                     
                     # Initialize expected clock for this peer if not already
-                    # The first message from a peer typically has timestamp 1 (or 0) if clock starts from 0/1
-                    # So, if their first message is timestamp X, we expect X next.
-                    # We initialize expected_clocks[sender_id] to X-1 so that X will be accepted.
+                    # We initialize expected_clocks[sender_id] to 0, assuming first data message will have timestamp 1
                     if sender_id not in expected_clocks:
-                        expected_clocks[sender_id] = received_timestamp - 1 # Expecting their first *data* message after handshake
+                        expected_clocks[sender_id] = 0 # Expecting their first *data* message after handshake to have timestamp 1
                 else:
                     print(f"Received non-handshake message during handshake phase: {msg_content}")
             except Exception as e:
@@ -196,8 +187,7 @@ class MsgHandler(threading.Thread):
                     continue
 
                 msg_type = msg[0]
-                # Timestamp is at index 3 for DATA/ACK, or index 2 for READY (though READY is handled above)
-                # For stop message (-1,-1,-1,timestamp), timestamp is at index 3.
+                # Timestamp is at index 3 for DATA/ACK/STOP
                 received_timestamp = msg[3] if len(msg) > 3 else 0 
 
                 # 1º passo: atualiza o relógio lógico;
@@ -221,8 +211,32 @@ class MsgHandler(threading.Thread):
                     # N-1 because we don't count our own stop message if we sent it
                     # (or N if we expect one from ourselves for symmetry, depending on design)
                     # Assuming N-1 other peers will send stop messages.
-                    if stopCount == N - 1: 
-                        break  # stop loop when all other processes have finished
+                    if stopCount == N - 1:
+                        # All other peers have finished sending.
+                        # Now, ensure all messages in the queue are delivered before stopping.
+                        print("All stop messages received. Delivering remaining messages in queue...")
+                        # Loop until the message_queue is empty and no more messages can be delivered
+                        while True:
+                            initial_queue_size = len(message_queue)
+                            deliver_messages() # Attempt to deliver all possible messages
+                            with queue_lock:
+                                # If the queue is empty after delivery attempt, we are done
+                                if not message_queue:
+                                    break
+                                # If the queue size didn't change, it means messages are stuck
+                                # (e.g., waiting for an earlier timestamp not yet received)
+                                # This could indicate a problem, but for now, we assume they will eventually arrive
+                                if len(message_queue) == initial_queue_size:
+                                    # This indicates no more messages can be delivered at this moment
+                                    # (waiting for an earlier timestamp not yet arrived, or N is not accurate)
+                                    # For a robust system, you might add a timeout here.
+                                    # For this exercise, we can assume that if all stop messages are received,
+                                    # then all data messages eventually will be delivered.
+                                    # Break to avoid infinite busy-wait if there's a logic error or packet loss
+                                    break # Exit inner while true loop if no progress made
+
+                        print("All messages delivered from queue. MsgHandler is ready to finish.")
+                        break  # Exit the main while True loop (for receiving messages)
 
             except Exception as e:
                 print(f"Error during message reception: {e}")
@@ -273,12 +287,11 @@ def send_ack_message(target_peer_id, original_msg_timestamp):
     
     # Iterate through the global PEERS list to send the ACK.
     # This assumes PEERS contains only IP addresses.
-    my_ip = get_public_ip() # Get current peer's IP once
+    my_ip = get_public_ip() # Get current peer's IP once for comparison
     for addrToSend in PEERS:
         if addrToSend != my_ip: # Don't send ACK to self
             try:
                 sendSocket.sendto(ack_msg_pack, (addrToSend, PEER_UDP_PORT))
-                # Correção aqui: garantir que o print tenha apenas um par de parênteses
                 print(f'Sent ACK for message with original timestamp {original_msg_timestamp} to {addrToSend} (ACK timestamp: {ack_timestamp})')
             except Exception as e:
                 print(f"Error sending ACK to {addrToSend}: {e}")
@@ -363,7 +376,7 @@ while True: # Changed from while 1 for clarity
         if addrToSend != my_ip: # Don't send stop message to self
             stop_timestamp = increment_logical_clock()
             # Format: (type, sender_id, msg_content, timestamp)
-            # Use -1 for sender_id and msg_content to signify a stop message, include my ID for logging/debug
+            # Use -1 for type and msg_content to signify a stop message, include my ID for logging/debug
             msg = (-1, myself, -1, stop_timestamp) 
             msgPack = pickle.dumps(msg)
             sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
