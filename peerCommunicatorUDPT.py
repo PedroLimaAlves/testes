@@ -36,6 +36,10 @@ queue_lock = threading.Lock()
 # This will help in ordering messages
 expected_clocks = {}
 
+# Make myself (peer ID) a global variable to be accessible in MsgHandler
+myself = -1 
+logList = [] # Make logList a global variable to be easily accessible for appending and sending
+
 def get_public_ip():
     ipAddr = get('https://api.ipify.org').content.decode('utf8')
     print('My public IP address is: {}'.format(ipAddr))
@@ -81,6 +85,9 @@ def increment_logical_clock():
 
 def deliver_messages():
     global expected_clocks
+    global myself # Declare myself as global to use it
+    global logList # Declare logList as global to use it
+
     while True:
         with queue_lock:
             if not message_queue:
@@ -88,11 +95,15 @@ def deliver_messages():
 
             # Check if the message at the top of the queue is ready for delivery
             # A message is ready if its timestamp matches the expected clock for its sender
+            # Structure: (timestamp, (msg_type, sender_id, msg_content, original_timestamp))
             next_timestamp, (msg_type, sender_id, msg_content, original_timestamp) = message_queue[0]
 
             if sender_id not in expected_clocks:
-                expected_clocks[sender_id] = 0 # Initialize if not seen before
+                # This should ideally be initialized when handshakes are received
+                expected_clocks[sender_id] = 0 
 
+            # Condition for ordered delivery: the message's timestamp must be 
+            # exactly one greater than the last delivered message from that sender.
             if next_timestamp == expected_clocks[sender_id] + 1:
                 # Message can be delivered
                 heapq.heappop(message_queue)
@@ -105,6 +116,8 @@ def deliver_messages():
                     send_ack_message(sender_id, original_timestamp)
                 elif msg_type == 'ACK':
                     print(f'ACK received from process {sender_id} for message with original timestamp {original_timestamp} (ACK timestamp: {next_timestamp})')
+                elif msg_type == -1: # Handle the stop message
+                    print(f'Stop message received from process {sender_id} (timestamp: {original_timestamp}, delivered at: {next_timestamp})')
                 else:
                     print(f"Unknown message type: {msg_type}")
             else:
@@ -118,52 +131,58 @@ class MsgHandler(threading.Thread):
         self.sock = sock
 
     def run(self):
-        print('Handler is ready. Waiting for the handshakes...')
-
+        # Mova todas as declarações global para o topo do método
         global handShakeCount
         global logList
-        logList = [] # This needs to be defined within the thread's scope or passed
+        global myself # 'myself' will be set by the main thread, and MsgHandler needs to access it
+        global expected_clocks
+        global message_queue # Ensure message_queue is accessible for clearing
 
+        print('Handler is ready. Waiting for the handshakes...')
+        
         # Wait until handshakes are received from all other processes
-        while handShakeCount < N:
+        while handShakeCount < N - 1: # N-1 because we don't handshake with ourselves
             msgPack, addr = self.sock.recvfrom(1024)
-            msg_type, sender_id = pickle.loads(msgPack)
+            msg = pickle.loads(msgPack)
+            msg_type = msg[0]
+            sender_id = msg[1]
+            # timestamp = msg[2] # Not strictly needed for handshake processing, but good to acknowledge it's there.
+
             if msg_type == 'READY':
                 handShakeCount += 1
                 print(f'--- Handshake received from: {sender_id}')
-                # Initialize expected clock for this peer
+                # Initialize expected clock for this peer when handshake is received
                 expected_clocks[sender_id] = 0
             else:
                 # This should not happen during handshake phase, but good for debugging
                 print(f"Unexpected message type during handshake: {msg_type}")
-
 
         print('Secondary Thread: Received all handshakes. Entering the loop to receive messages.')
 
         stopCount = 0
         while True:
             msgPack, addr = self.sock.recvfrom(32768)
-            msg = pickle.loads(msgPack)
-            msg_type = msg[0]
-            received_timestamp = msg[3] if len(msg) > 3 else 0 # Assuming timestamp is at index 3 for data/ack
+            msg_data = pickle.loads(msgPack)
+            msg_type = msg_data[0]
+            
+            # Ensure msg_data has enough elements before accessing index 3
+            received_timestamp = msg_data[3] if len(msg_data) > 3 else 0 
 
             # 1º passo: atualiza o relógio lógico;
             update_logical_clock(received_timestamp)
 
             # 2° passo: coloca a mensagem na fila;
             with queue_lock:
-                # msg format: (type, sender_id, msg_content, original_timestamp)
-                heapq.heappush(message_queue, (received_timestamp, msg))
+                # Store (received_timestamp, original_message_tuple) for priority queue
+                heapq.heappush(message_queue, (received_timestamp, msg_data))
             
             # 3° passo: Se é mensagem de dados então enviar ACK (se for mensagem de ACK só faz 1º e 2º passo);
-            # This is handled by deliver_messages now
-
             # 4º passo: verifica se "destrava" a primeira mensagem da fila e entrega a mensagem para a aplicação;
             deliver_messages()
 
             if msg_type == -1:  # count the 'stop' messages from the other processes
                 stopCount = stopCount + 1
-                if stopCount == N:
+                if stopCount == N - 1: # N-1 because we wait for stop signals from other peers, not ourselves
                     break  # stop loop when all other processes have finished
             
         # Write log file
@@ -179,8 +198,7 @@ class MsgHandler(threading.Thread):
         clientSock.send(msgPack)
         clientSock.close()
 
-        # Reset the handshake counter
-        global handShakeCount
+        # Reset the handshake counter for a new round
         handShakeCount = 0
         
         # Reset expected clocks for a new round
@@ -189,66 +207,55 @@ class MsgHandler(threading.Thread):
         # Clear the message queue for a new round
         with queue_lock:
             message_queue.clear()
-
+        
+        logList.clear() # Clear the log list for a new round
+        
         # This exit will stop the entire process. If you want to run multiple rounds
         # without restarting the peer, you'll need to remove this and manage the lifecycle
         # differently (e.g., by signaling the main thread to prepare for a new round).
         exit(0)
 
-def send_ack_message(target_peer_id, original_msg_timestamp):
+def send_ack_message(sender_id, original_msg_timestamp):
+    global myself # Declare myself as global to use it
+    global PEERS # Declare PEERS as global to use it
+
     ack_timestamp = increment_logical_clock()
-    # Find the IP address for the target_peer_id from the PEERS list
-    target_ip = None
-    for ip in PEERS:
-        # Assuming PEERS contains just IP addresses. If it was (IP, Port), adjust this.
-        # For this example, assuming `PEERS` contains only the IP addresses.
-        # If `PEERS` contained (IP, Port), you'd need to adapt.
-        # For simplicity, assuming target_peer_id can be mapped to an IP in PEERS
-        # This is a simplification; in a real system, you'd map peer IDs to their addresses.
-        # As PEERS is a list of IPs, we'd need a more robust way to map target_peer_id to an IP
-        # or send ACK to all if we don't have a specific target IP.
-        # Let's assume PEERS are indexed by 0, 1, 2... for simplicity to get the IP.
-        # A better solution would be to pass the actual IP of the sender to send the ACK back.
-        pass # Placeholder: The original structure of PEERS in the code just lists IPs.
-             # We need to know *which* peer sent the message to send an ACK back to it.
-             # For now, let's just send to all, which isn't ideal for a targeted ACK.
-             # A more correct approach would be to include the sender's IP in the original message.
-
-    # For the purpose of demonstration, let's assume `PEERS` contains a list of IPs,
-    # and we need to send the ACK back to the *sender* of the data message.
-    # The `addr` from `recvfrom` in `MsgHandler` would be the correct recipient.
-    # However, `send_ack_message` is called later, out of that scope.
-    # To correctly send an ACK, the original message should contain the sender's full address.
-    # For now, as a temporary measure, we will iterate through `PEERS` and send to all,
-    # which is inefficient but demonstrates the ACK message structure.
-    # It's crucial to refine this in a production environment.
-
-    # Revised ACK sending: The data message should carry the sender's IP.
-    # The current message format is (myself, msgNumber). It needs to be (myself, msgNumber, my_ip_address, timestamp).
-    # Then the ACK can be sent back to my_ip_address.
-
-    # Since the current data message only has (sender_id, msg_content), we'll assume
-    # for now that we can iterate through the PEERS list and send an ACK to every peer,
-    # or that `target_peer_id` can be directly mapped to an IP in `PEERS`.
-    # This is a simplification for demonstration.
-
+    
+    # Message format: (type, sender_id_of_ack, original_msg_timestamp, ack_timestamp)
     ack_msg = ('ACK', myself, original_msg_timestamp, ack_timestamp)
     ack_msg_pack = pickle.dumps(ack_msg)
     
-    # This loop is a temporary workaround. A proper ACK would be sent *directly* to the sender.
-    # The sender's address needs to be part of the initial data message.
+    # In a real scenario, you would send the ACK only to the `sender_id`
+    # You would need a mapping from `sender_id` to `IP_address` if `PEERS` only contains IPs.
+    # For now, as a demonstration, we will send to all peers except ourselves.
+    # This is not efficient for a targeted ACK but shows the ACK message.
+    
+    # To properly send an ACK to a specific sender, the initial DATA message
+    # should carry the sender's IP address.
+    # For instance, if msg_data was ('DATA', myself, msg_content, current_logical_clock, my_ip),
+    # then you could use my_ip here.
+    
+    # Assuming for this simplified example that we need to find the IP of the original sender.
+    # If the PEERS list is just IPs, this part is tricky without a proper peer-ID-to-IP mapping.
+    # For simplicity, let's assume we iterate all peers and send to all *other* peers.
+    
+    # IMPORTANT: THIS IS A SIMPLIFICATION. A proper ACK targets the sender.
+    # You need a mechanism to map `sender_id` back to their IP address if `PEERS` is just a list of IPs.
+    # For now, it sends to all other peers, demonstrating the ACK structure.
     for addrToSend in PEERS:
         if addrToSend != get_public_ip(): # Don't send ACK to self
-            sendSocket.sendto(ack_msg_pack, (addrToSend, PEER_UDP_PORT))
+            sendSocket.sendto(ack_msg_pack, (addrToSend,PEER_UDP_PORT))
             print(f'Sent ACK for message with original timestamp {original_msg_timestamp} to {addrToSend} (ACK timestamp: {ack_timestamp})')
 
 
 # Function to wait for start signal from comparison server:
 def waitToStart():
+    global myself # Declare myself as global here too
+
     (conn, addr) = serverSock.accept()
     msgPack = conn.recv(1024)
     msg = pickle.loads(msgPack)
-    myself = msg[0]
+    myself = msg[0] # Set the global myself
     nMsgs = msg[1]
     conn.send(pickle.dumps(f'Peer process {myself} started.'))
     conn.close()
@@ -258,7 +265,7 @@ def waitToStart():
 registerWithGroupManager()
 while 1:
     print('Waiting for signal to start...')
-    (myself, nMsgs) = waitToStart()
+    (myself, nMsgs) = waitToStart() # myself is set here
     print(f'I am up, and my ID is: {myself}')
 
     if nMsgs == 0:
@@ -269,12 +276,6 @@ while 1:
     global PEERS # ensure PEERS is accessible
     PEERS = getListOfPeers() # Get the latest list of peers
     
-    for peer_ip in PEERS:
-        # Initialize expected_clocks for all peers. For self, it's not relevant for incoming.
-        # This setup assumes `PEERS` are IP addresses.
-        # For a truly robust system, PEERS should include more info like a unique peer ID.
-        pass # The initialization of expected_clocks for incoming messages is done in MsgHandler when handshakes are received.
-
     # Create receiving message handler
     msgHandler = MsgHandler(recvSocket)
     msgHandler.start()
@@ -315,6 +316,7 @@ while 1:
     for addrToSend in PEERS:
         if addrToSend != get_public_ip(): # Don't send stop message to self
             stop_timestamp = increment_logical_clock()
-            msg = (-1,-1, -1, stop_timestamp) # -1 is the stop signal
+            # Message format: (type, sender_id, dummy_content, timestamp)
+            msg = (-1, myself, -1, stop_timestamp) # -1 is the stop signal
             msgPack = pickle.dumps(msg)
             sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
