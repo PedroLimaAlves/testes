@@ -163,9 +163,17 @@ class MsgHandler(threading.Thread):
                     handShakeCount += 1
                     print(f'[{time.time()}] --- Handshake received from {addr[0]}. Total handshakes: {handShakeCount}')
                 elif msg["type"] == 'ACK' and msg["original_type"] == 'READY':
-                    # Este peer enviou um handshake e recebeu um ACK. Não precisamos fazer nada aqui.
-                    print(f"[{time.time()}] Peer {myself} RECEIVED and REMOVED ACK for msg ID {msg['msg_id']} from {addr[0]} (Original: {msg['original_type']}). Pending ACKs count: {len(pending_acks)}") # Adicionado
-                    pass
+                    # ESTE É O AJUSTE CRÍTICO:
+                    # Este peer enviou um handshake e recebeu um ACK. Precisamos removê-lo de pending_acks.
+                    with pending_acks_lock:
+                        key = (addr[0], PEER_UDP_PORT, msg["msg_id"]) # O IP no ACK recebido é o IP do REMETENTE original (ou seja, quem enviou o READY original)
+                        if key in pending_acks:
+                            del pending_acks[key]
+                            print(f"[{time.time()}] Peer {myself} RECEIVED and REMOVED ACK for MY READY msg ID {msg['msg_id']} from {addr[0]}. Pending ACKs count: {len(pending_acks)}")
+                        else:
+                            print(f"[{time.time()}] Peer {myself} WARNING: Received ACK for UNKNOWN READY msg ID {msg['msg_id']} from {addr[0]}. Already processed or never sent?")
+                    increment_logical_clock(msg["clock"]) # Atualiza o relógio com base no ACK do READY
+                    # Não precisamos de 'continue' aqui, apenas saímos do 'elif'
                 else:
                     # Se uma mensagem de dados for recebida antes do handshake completo, a bufferiza.
                     print(f"[{time.time()}] Received non-handshake message from {addr[0]} during handshake phase. Buffering.")
