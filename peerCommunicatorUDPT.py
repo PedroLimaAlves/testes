@@ -123,7 +123,7 @@ class MsgHandler(threading.Thread):
         print('Handler is ready. Waiting for the handshakes...')
         
         global handShakeCount
-        global N
+        global N # N is not defined globally, leading to NameError if not provided by external constMPT.py
         
         # Wait until handshakes are received from all other processes
         while handShakeCount < N:
@@ -236,8 +236,8 @@ while 1:
     # Initialize expected sequence numbers for all peers for the new round
     # This must be done for all peers, not just those from whom we've received handshakes.
     # We need the total number of peers (N) for this.
-    global expected_sequence_numbers, incoming_message_queues
-    expected_sequence_numbers = {i: 0 for i in range(N) if i != myself} # Initialize for all other peers
+    # REMOVED THE 'global' KEYWORD HERE
+    expected_sequence_numbers = {i: 0 for i in range(N) if i != myself} 
     incoming_message_queues = {i: [] for i in range(N) if i != myself}
 
 
