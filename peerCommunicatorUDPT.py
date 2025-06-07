@@ -214,7 +214,7 @@ def main():
     handler_thread.join(timeout=5)
     print(f"Peer {myself} fully terminated.")
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
