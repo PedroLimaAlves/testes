@@ -23,12 +23,10 @@ serverSock.listen(1)
 myself = None
 clock = 0
 
-
 def get_public_ip():
     ipAddr = get('https://api.ipify.org').content.decode('utf8')
     print('My public IP address is: {}'.format(ipAddr))
     return ipAddr
-
 
 def registerWithGroupManager():
     clientSock = socket(AF_INET, SOCK_STREAM)
@@ -40,7 +38,6 @@ def registerWithGroupManager():
     print('Registering with group manager: ', req)
     clientSock.send(msg)
     clientSock.close()
-
 
 def getListOfPeers():
     clientSock = socket(AF_INET, SOCK_STREAM)
@@ -55,7 +52,6 @@ def getListOfPeers():
     print('Got list of peers: ', peers)
     clientSock.close()
     return peers
-
 
 def tryDeliver():
     global recvQueue, deliveredSet
@@ -74,7 +70,6 @@ def tryDeliver():
 
     for m in delivered:
         recvQueue.remove(m)
-
 
 class MsgHandler(threading.Thread):
     def __init__(self, sock):
@@ -138,7 +133,6 @@ class MsgHandler(threading.Thread):
         handShakeCount = 0
         exit(0)
 
-
 def waitToStart():
     (conn, addr) = serverSock.accept()
     msgPack = conn.recv(1024)
@@ -149,7 +143,6 @@ def waitToStart():
     conn.send(pickle.dumps('Peer process ' + str(myself) + ' started.'))
     conn.close()
     return myself, nMsgs
-
 
 registerWithGroupManager()
 while True:
@@ -176,7 +169,6 @@ while True:
     while handShakeCount < N:
         pass
 
-    global clock
     for msgNumber in range(0, nMsgs):
         clock += 1
         msg = (myself, msgNumber, clock)
